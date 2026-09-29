@@ -45,7 +45,7 @@ The dashboard-managed instance uses `/usr/bin/goshs`; its PID is stored at
   "auto_start": true,
   "webroot": "/mnt/user/binaries",
   "listen_ip": "0.0.0.0",
-  "port": 8000,
+  "port": 8021,
   "read_only": true,
   "no_chat": true,
   "webdav": false,

@@ -10,6 +10,45 @@ LOG_FILE="/var/log/goshs.log"
 RUNTIME_BIN="/usr/bin/goshs"
 UPSTREAM_REPO="goshs-labs/goshs"
 
+probe_host() {
+  local listen_ip
+  listen_ip="$(jq -r '.listen_ip // "0.0.0.0"' "$SETTINGS_FILE" 2>/dev/null)"
+  case "$listen_ip" in
+    0.0.0.0|::|"") printf '%s\n' "127.0.0.1" ;;
+    *) printf '%s\n' "$listen_ip" ;;
+  esac
+}
+
+configured_port() {
+  jq -r '.port // 8021' "$SETTINGS_FILE" 2>/dev/null
+}
+
+goshs_endpoint_ok() {
+  local host port headers body
+  host="$(probe_host)"
+  port="$(configured_port)"
+  headers="$(mktemp)"
+  body="$(mktemp)"
+
+  if ! curl -fsS --max-time 2 -D "$headers" "http://$host:$port/?json" -o "$body"; then
+    rm -f "$headers" "$body"
+    return 1
+  fi
+
+  if ! grep -qi '^Server: goshs/' "$headers"; then
+    rm -f "$headers" "$body"
+    return 1
+  fi
+
+  if ! jq -e 'type == "array"' "$body" >/dev/null 2>&1; then
+    rm -f "$headers" "$body"
+    return 1
+  fi
+
+  rm -f "$headers" "$body"
+  return 0
+}
+
 get_auth_header() {
   local encrypted token
   encrypted="$(jq -r '.github // empty' /boot/config/system/tokens.json 2>/dev/null)"
@@ -68,7 +107,7 @@ build_args() {
   local webroot listen_ip port read_only no_chat webdav webdav_port
   webroot="$(jq -r '.webroot // "/mnt/user/binaries"' "$SETTINGS_FILE" 2>/dev/null)"
   listen_ip="$(jq -r '.listen_ip // "0.0.0.0"' "$SETTINGS_FILE" 2>/dev/null)"
-  port="$(jq -r '.port // 8000' "$SETTINGS_FILE" 2>/dev/null)"
+  port="$(jq -r '.port // 8021' "$SETTINGS_FILE" 2>/dev/null)"
   read_only="$(jq -r '.read_only // true' "$SETTINGS_FILE" 2>/dev/null)"
   no_chat="$(jq -r '.no_chat // true' "$SETTINGS_FILE" 2>/dev/null)"
   webdav="$(jq -r '.webdav // false' "$SETTINGS_FILE" 2>/dev/null)"
@@ -86,8 +125,12 @@ build_args() {
 
 start_server() {
   if is_running; then
-    echo "Already running (PID: $(cat "$PID_FILE"))"
-    return 0
+    if goshs_endpoint_ok; then
+      echo "Already running (PID: $(cat "$PID_FILE"))"
+      return 0
+    fi
+    echo "Tracked GoSHS process is running but the configured endpoint is not GoSHS." >&2
+    return 1
   fi
 
   [ -x "$RUNTIME_BIN" ] || {
@@ -96,17 +139,26 @@ start_server() {
   }
 
   build_args || return 1
+
+  if curl -fsS --max-time 1 "http://$(probe_host):$(configured_port)/" >/dev/null 2>&1; then
+    if ! goshs_endpoint_ok; then
+      echo "Port $(configured_port) is already in use by another HTTP service." >&2
+      return 1
+    fi
+  fi
+
   mkdir -p "$(dirname "$LOG_FILE")"
   nohup "$RUNTIME_BIN" "${GOSHS_ARGS[@]}" >>"$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
-  sleep 0.7
+  sleep 1
 
-  if kill -0 "$pid" 2>/dev/null; then
+  if kill -0 "$pid" 2>/dev/null && goshs_endpoint_ok; then
     echo "Started GoSHS (PID: $pid)"
   else
+    kill "$pid" 2>/dev/null || true
     rm -f "$PID_FILE"
-    echo "Failed to start GoSHS. Check $LOG_FILE" >&2
+    echo "Failed to start GoSHS on port $(configured_port). The port may be in use; check $LOG_FILE" >&2
     return 1
   fi
 }
@@ -196,11 +248,13 @@ case "$1" in
     start_server
     ;;
   status)
-    if is_running; then
-      printf '{"running":true,"pid":%s}\n' "$(cat "$PID_FILE")"
+    if is_running && goshs_endpoint_ok; then
+      printf '{"running":true,"healthy":true,"pid":%s,"port":%s}\n' "$(cat "$PID_FILE")" "$(configured_port)"
+    elif is_running; then
+      printf '{"running":false,"healthy":false,"pid":%s,"port":%s,"error":"configured endpoint is not GoSHS"}\n' "$(cat "$PID_FILE")" "$(configured_port)"
     else
       rm -f "$PID_FILE"
-      printf '{"running":false,"pid":null}\n'
+      printf '{"running":false,"healthy":false,"pid":null,"port":%s}\n' "$(configured_port)"
     fi
     ;;
   log)
