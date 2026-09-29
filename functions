@@ -1,0 +1,59 @@
+#!/bin/bash
+
+PLUGIN_NAME="goshs"
+PLG_DIR="/boot/optional/plugins/$PLUGIN_NAME"
+PID_FILE="/var/run/mos-goshs.pid"
+RUNTIME_BIN="/usr/bin/goshs"
+
+_stop_goshs() {
+  if [ -f "$PID_FILE" ]; then
+    PID="$(cat "$PID_FILE" 2>/dev/null)"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      kill "$PID" 2>/dev/null
+      sleep 1
+      kill -9 "$PID" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+  fi
+}
+
+install() {
+  mkdir -p "$PLG_DIR"
+}
+
+uninstall() {
+  _stop_goshs
+  rm -f "$RUNTIME_BIN"
+}
+
+plugin_update() {
+  mos_start
+}
+
+mos_start() {
+  mkdir -p "$PLG_DIR"
+  if [ -x "$PLG_DIR/goshs-bin" ]; then
+    cp -f "$PLG_DIR/goshs-bin" "$RUNTIME_BIN"
+    chmod 0755 "$RUNTIME_BIN"
+  fi
+}
+
+mos_start_after_services() {
+  local auto_start
+  auto_start="$(jq -r '.auto_start // true' "$PLG_DIR/settings.json" 2>/dev/null)"
+
+  if [ "$auto_start" != "true" ]; then
+    return 0
+  fi
+
+  if [ ! -x "$RUNTIME_BIN" ]; then
+    echo "GoSHS auto-start skipped: runtime is not installed."
+    return 0
+  fi
+
+  /usr/bin/plugins/goshs start
+}
+
+mos_osupdate() {
+  mos_start
+}

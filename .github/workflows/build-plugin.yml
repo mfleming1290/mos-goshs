@@ -1,0 +1,98 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - '[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Plugin version'
+        required: true
+        default: '0.1.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download icon
+        run: wget -O icon.png "https://raw.githubusercontent.com/mfleming1290/mos-hub/main/images/goshsIcon.png"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build Vue page
+        working-directory: page
+        env:
+          PLUGIN_VERSION: ${{ steps.version.outputs.VERSION }}
+        run: npm install && npm run build
+
+      - name: Build plugin deb
+        shell: bash
+        run: |
+          set -eux
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          PKG_NAME="goshs-${VERSION}-1+mos-plugin"
+          PKG_DIR="${PKG_NAME}_all"
+          DEB_FILE="${PKG_NAME}_all.deb"
+
+          mkdir -p "$PKG_DIR/var/www/mos-plugins/goshs"
+          mkdir -p "$PKG_DIR/usr/bin/plugins"
+          mkdir -p "$PKG_DIR/DEBIAN"
+
+          cp -R page/dist/goshs/* "$PKG_DIR/var/www/mos-plugins/goshs/"
+          cp goshs "$PKG_DIR/usr/bin/plugins/goshs"
+          chmod 0755 "$PKG_DIR/usr/bin/plugins/goshs"
+          cp icon.png "$PKG_DIR/var/www/mos-plugins/goshs/"
+
+          cat > "$PKG_DIR/DEBIAN/control" <<CONTROL
+          Package: mos-goshs-plugin
+          Version: ${VERSION}-1+mos-plugin
+          Architecture: all
+          Maintainer: mfleming1290
+          Description: GoSHS file server plugin for MOS
+          CONTROL
+
+          cat > "$PKG_DIR/DEBIAN/postinst" <<'POSTINST'
+          #!/bin/bash
+          chmod 0755 /usr/bin/plugins/goshs 2>/dev/null || true
+          exit 0
+          POSTINST
+          chmod 0755 "$PKG_DIR/DEBIAN/postinst"
+
+          dpkg-deb --build "$PKG_DIR" "$DEB_FILE"
+          md5sum "$DEB_FILE" | awk '{print $1}' > "${DEB_FILE}.md5"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: MOS GoSHS Plugin ${{ steps.version.outputs.VERSION }}
+          body: |
+            GoSHS plugin for MOS.
+
+            The plugin installs and updates the upstream GoSHS runtime from
+            goshs-labs/goshs, then manages the common file-server settings
+            from the MOS dashboard.
+          files: |
+            goshs-${{ steps.version.outputs.VERSION }}-1+mos-plugin_all.deb
+            goshs-${{ steps.version.outputs.VERSION }}-1+mos-plugin_all.deb.md5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

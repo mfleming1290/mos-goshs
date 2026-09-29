@@ -1,0 +1,213 @@
+#!/bin/bash
+
+. /usr/local/lib/functions/mos-common 2>/dev/null || true
+
+PLUGIN_NAME="goshs"
+PLG_DIR="/boot/optional/plugins/$PLUGIN_NAME"
+SETTINGS_FILE="$PLG_DIR/settings.json"
+PID_FILE="/var/run/mos-goshs.pid"
+LOG_FILE="/var/log/goshs.log"
+RUNTIME_BIN="/usr/bin/goshs"
+UPSTREAM_REPO="goshs-labs/goshs"
+
+get_auth_header() {
+  local encrypted token
+  encrypted="$(jq -r '.github // empty' /boot/config/system/tokens.json 2>/dev/null)"
+  if [ -n "$encrypted" ] && command -v decrypt_password >/dev/null 2>&1; then
+    token="$(decrypt_password "$encrypted" "tokens" 2>/dev/null)"
+    if [ -n "$token" ]; then
+      printf '%s' "Authorization: Bearer $token"
+    fi
+  fi
+}
+
+github_json() {
+  local url="$1"
+  local header
+  header="$(get_auth_header)"
+  if [ -n "$header" ]; then
+    curl -fsSL -H "$header" "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
+get_latest_version() {
+  local json version
+  json="$(github_json "https://api.github.com/repos/$UPSTREAM_REPO/releases/latest" 2>/dev/null)" || true
+  version="$(printf '%s' "$json" | jq -r '.tag_name // empty' 2>/dev/null)"
+  [ -n "$version" ] && printf '%s\n' "$version" || printf '%s\n' "v0"
+}
+
+current_version() {
+  jq -r '.version // empty' "$SETTINGS_FILE" 2>/dev/null
+}
+
+is_running() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+stop_server() {
+  if is_running; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.2
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+}
+
+build_args() {
+  local webroot listen_ip port read_only no_chat webdav webdav_port
+  webroot="$(jq -r '.webroot // "/mnt/user/binaries"' "$SETTINGS_FILE" 2>/dev/null)"
+  listen_ip="$(jq -r '.listen_ip // "0.0.0.0"' "$SETTINGS_FILE" 2>/dev/null)"
+  port="$(jq -r '.port // 8000' "$SETTINGS_FILE" 2>/dev/null)"
+  read_only="$(jq -r '.read_only // true' "$SETTINGS_FILE" 2>/dev/null)"
+  no_chat="$(jq -r '.no_chat // true' "$SETTINGS_FILE" 2>/dev/null)"
+  webdav="$(jq -r '.webdav // false' "$SETTINGS_FILE" 2>/dev/null)"
+  webdav_port="$(jq -r '.webdav_port // 8001' "$SETTINGS_FILE" 2>/dev/null)"
+
+  [ -d "$webroot" ] || mkdir -p "$webroot" || return 1
+
+  GOSHS_ARGS=(-d "$webroot" -i "$listen_ip" -p "$port")
+  [ "$read_only" = "true" ] && GOSHS_ARGS+=(--read-only)
+  [ "$no_chat" = "true" ] && GOSHS_ARGS+=(--no-chat)
+  if [ "$webdav" = "true" ]; then
+    GOSHS_ARGS+=(--webdav --webdav-port "$webdav_port")
+  fi
+}
+
+start_server() {
+  if is_running; then
+    echo "Already running (PID: $(cat "$PID_FILE"))"
+    return 0
+  fi
+
+  [ -x "$RUNTIME_BIN" ] || {
+    echo "GoSHS runtime not installed. Install it from the plugin page first." >&2
+    return 1
+  }
+
+  build_args || return 1
+  mkdir -p "$(dirname "$LOG_FILE")"
+  nohup "$RUNTIME_BIN" "${GOSHS_ARGS[@]}" >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PID_FILE"
+  sleep 0.7
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Started GoSHS (PID: $pid)"
+  else
+    rm -f "$PID_FILE"
+    echo "Failed to start GoSHS. Check $LOG_FILE" >&2
+    return 1
+  fi
+}
+
+install_binary() {
+  local version arch asset url tmp archive extracted
+  version="$(get_latest_version)"
+  [ "$version" != "v0" ] || {
+    echo "Could not determine latest GoSHS version." >&2
+    return 1
+  }
+
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x86_64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      echo "Unsupported architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+
+  asset="goshs_${version}_linux_${arch}.tar.gz"
+  url="https://github.com/$UPSTREAM_REPO/releases/download/${version}/${asset}"
+  tmp="$(mktemp -d)"
+  archive="$tmp/$asset"
+
+  echo "Downloading GoSHS $version for $arch..."
+  if ! curl -fL "$url" -o "$archive"; then
+    rm -rf "$tmp"
+    echo "Download failed: $url" >&2
+    return 1
+  fi
+
+  if ! tar -xzf "$archive" -C "$tmp"; then
+    rm -rf "$tmp"
+    echo "Could not extract GoSHS archive." >&2
+    return 1
+  fi
+
+  extracted="$(find "$tmp" -type f -name goshs -print -quit)"
+  if [ -z "$extracted" ]; then
+    rm -rf "$tmp"
+    echo "GoSHS binary not found in release archive." >&2
+    return 1
+  fi
+
+  mkdir -p "$PLG_DIR"
+  cp -f "$extracted" "$PLG_DIR/goshs-bin"
+  chmod 0755 "$PLG_DIR/goshs-bin"
+  cp -f "$PLG_DIR/goshs-bin" "$RUNTIME_BIN"
+  chmod 0755 "$RUNTIME_BIN"
+
+  jq --arg version "$version" '.version = $version' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" &&
+    mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+
+  rm -rf "$tmp"
+  echo "Installed GoSHS $version"
+}
+
+case "$1" in
+  check_version)
+    current="$(current_version)"
+    [ -n "$current" ] || current="not installed"
+    latest="$(get_latest_version)"
+    if [ "$current" = "$latest" ]; then
+      printf '{"current":"%s","latest":"%s","update_available":false}\n' "$current" "$latest"
+    else
+      printf '{"current":"%s","latest":"%s","update_available":true}\n' "$current" "$latest"
+    fi
+    ;;
+  install_binary)
+    was_running=false
+    is_running && was_running=true
+    [ "$was_running" = "true" ] && stop_server
+    install_binary || exit $?
+    [ "$was_running" = "true" ] && start_server
+    ;;
+  start)
+    start_server
+    ;;
+  stop)
+    stop_server
+    echo "Stopped"
+    ;;
+  restart)
+    stop_server
+    start_server
+    ;;
+  status)
+    if is_running; then
+      printf '{"running":true,"pid":%s}\n' "$(cat "$PID_FILE")"
+    else
+      rm -f "$PID_FILE"
+      printf '{"running":false,"pid":null}\n'
+    fi
+    ;;
+  log)
+    tail -n 100 "$LOG_FILE" 2>/dev/null || true
+    ;;
+  *)
+    echo "Usage: $0 {check_version|install_binary|start|stop|restart|status|log}" >&2
+    exit 2
+    ;;
+esac

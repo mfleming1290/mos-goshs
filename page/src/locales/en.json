@@ -1,0 +1,9 @@
+{
+  "plugin_goshs": {
+    "title": "GoSHS",
+    "description": "Serve files from MOS with GoSHS.",
+    "status": "Status",
+    "running": "Running",
+    "stopped": "Stopped"
+  }
+}
